@@ -1,0 +1,837 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#1 Intro
+
+Dataset: https://figshare.com/articles/Single-cell_RNA-seq_data_from_Smart-seq2_sequencing_of_FACS_sorted_cells/5715040
+
+Organ: **Diaphragm**
+Method: FACS
+
+
+#2 Preprocessing
+
+##2.1 Load Packages
+
+```{r}
+library(tidyverse) # bundle of package for data science
+library(cowplot) # ggplot addon for publication plot
+library(SingleCellExperiment) #S4 vector for SC data
+library(scater) # Toolkit for SC data analysis
+library(scran)# function for low level SC analysis
+library(edgeR) # famous package for DE analysis
+library(matrixStats)# package for matrix statistics
+library(igraph) # package for graph
+library(biomaRt) #allows for annotation of genes
+library(SC3) #package for consensus clustering
+```
+
+##2.2 Creating SingleCellExperiment Object
+
+read the counts file and add annotations
+```{r}
+#setting seed
+set.seed(1897)
+library(readr)
+Diaphragm_counts = read.delim("Diaphragm-counts.csv", sep=",", header=TRUE)
+dim(Diaphragm_counts)
+rownames(Diaphragm_counts) <- Diaphragm_counts[,1]
+Diaphragm_counts <- Diaphragm_counts[,-1]
+cellIDs <- colnames(Diaphragm_counts)
+cell_info <- strsplit(cellIDs, "\\.")
+Well <- lapply(cell_info, function(x){x[1]})
+Well <- unlist(Well)
+Plate <- unlist(lapply(cell_info, function(x){x[2]}))
+Mouse <- unlist(lapply(cell_info, function(x){x[3]}))
+
+ann <- read.table("annotations_FACS.csv", sep=",", header=TRUE)
+ann <- ann[match(cellIDs, ann[,1]),]
+celltype <- ann[,3]
+cell_anns <- data.frame(mouse = Mouse, well=Well, type=celltype)
+rownames(cell_anns) <- colnames(Diaphragm_counts)
+```
+
+show annotated cell types encountered
+```{r}
+unique(celltype)
+length(unique(celltype))
+```
+
+check for spike-in information named ERCC for FACS
+```{r}
+rownames(Diaphragm_counts)[grep("^ERCC-", rownames(Diaphragm_counts))]
+```
+
+check for presence of ribosomal genes
+```{r}
+rownames(Diaphragm_counts)[grep("^Rp[sl][[:digit:]]", rownames(Diaphragm_counts))]
+ribo.genes <- grep(pattern = "^Rp[sl][[:digit:]]", x = rownames(Diaphragm_counts), value = TRUE)
+length(ribo.genes)
+```
+
+
+create S4 object with extrated data
+```{r}
+diaph_sce <- SingleCellExperiment(assays = list(counts = as.matrix(Diaphragm_counts)), colData=cell_anns)
+head(diaph_sce)
+```
+
+move ERCC spike data to its own category, to study its behaviour separately
+```{r}
+isSpike(diaph_sce, "ERCC") <- grepl("^ERCC-", rownames(diaph_sce))
+```
+
+```{r}
+table(isSpike(diaph_sce, "ERCC"))
+spikeNames(diaph_sce)
+```
+
+move ribosomal genes to its own spike category:
+Ribosomal genes do not contribute to heterogeneity of cells. 
+They could be present in any cell, so I separated them in order to leave them out later
+```{r}
+isSpike(diaph_sce, "ribo") <- grepl("^^Rp[sl][[:digit:]]", rownames(diaph_sce))
+```
+
+```{r}
+table(isSpike(diaph_sce, "ribo"))
+spikeNames(diaph_sce)
+head(diaph_sce)
+dim(diaph_sce)
+```
+
+```{r}
+is.ercc <- isSpike(diaph_sce, "ERCC")
+is.ribo <- isSpike(diaph_sce, "ribo")
+```
+
+
+```{r}
+table(isSpike(diaph_sce))
+```
+
+create a copy sce
+```{r}
+my_diaph_sce <- diaph_sce
+```
+
+
+
+
+
+#3 Feature Selection
+
+##3.1 Basic gene filtering
+
+###3.1.1 Gene expression profile
+
+Average expression of a gene and the variance in read counts:
+```{r}
+#Calculate gene mean across cell
+gene_mean <- rowMeans(counts(diaph_sce)) 
+#Calculate gene variance across cell
+gene_var  <- rowVars(counts(diaph_sce))  
+#ggplot plot
+gene_stat_df <- tibble(gene_mean,gene_var)
+
+ggplot(data=gene_stat_df ,aes(x=log(gene_mean), y=log(gene_var))) + geom_point(size=0.5)  + theme_classic()
+```
+
+###3.1.2 Filtering out low abundance genes
+
+Show min and max of gene_mean  and initial number of cells:
+```{r}
+print(paste0( "min gene_mean = ",min(gene_mean)))
+print(paste0( "max gene_mean = ",max(gene_mean)))
+numcells <- nexprs(diaph_sce, byrow=TRUE) 
+print(paste0("initial number of cells: ",length(numcells)))
+```
+
+Choose log-transformed values in plots to better view really low and high values at once.
+
+Plot initial counts and highlight spike groups:
+```{r}
+smoothScatter(log10(gene_mean), numcells,xlab=expression(Log[10]~"average count"),ylab="Number of expressing cells")
+
+points(log10(gene_mean[is.ercc]), numcells[is.ercc], col="red", pch= 16,cex=0.5)
+points(log10(gene_mean[is.ribo]), numcells[is.ribo], col="green", pch= 16,cex=0.5)
+```
+ERCC spike data are well embedded in the counts, whereas ribosomal genes behave like outliers.
+
+Remove low abundance genes, show how many to keep:
+```{r}
+abundant_genes <- gene_mean > 1 
+
+print(paste0("abundant genes: ",length(abundant_genes)))
+print(paste0("genes to keep: ",sum(abundant_genes)))
+```
+
+plot low abundance gene filtering
+```{r}
+hist(log2(gene_mean), breaks=100, main="", col="grey80",
+     xlab=expression(Log[2]~"average count"))
+abline(v=log2(0.1), col="red", lwd=2, lty=2)
+```
+
+
+remove low abundance genes in SingleCellExperiment Object 
+```{r}
+diaph_sce<- diaph_sce[abundant_genes,]
+dim(diaph_sce)
+head(diaph_sce)
+```
+
+
+###3.1.3 Filtering genes that are expressed in very few cells
+
+Calculate the number of non zero expression for each gene
+```{r}
+numcells <- nexprs(diaph_sce, byrow=TRUE) 
+length(numcells)
+```
+
+Filter genes detected in less than 5 cells
+```{r}
+numcells2 <- numcells >= 5
+diaph_sce <- diaph_sce[numcells2,]
+dim(diaph_sce)
+```
+
+
+###3.1.4 Plot the distributions of library sizes, numbers of genes expressed and ribosomal genes expressed, now we have filtered the data.
+
+This function calculates useful quality control metrics to help with pre-processing of data and identification of potentially problematic features and cells.
+```{r}
+diaph_sce <- calculateQCMetrics(diaph_sce)
+```
+
+```{r}
+colnames(colData(diaph_sce))
+```
+
+Low quality cells = low library sizes (due to tecnhical effects during measurement)
+Low quality of features = cells with few genes expressed
+```{r}
+par(mfrow=c(2,1), mar=c(5.1, 4.1, 0.1, 0.1))
+hist(diaph_sce$total_counts/1e6, xlab="Library sizes (millions)", main="", 
+     breaks=20, col="grey80", ylab="Number of cells")
+hist(diaph_sce$total_features_by_counts, xlab="Number of expressed genes", main="", 
+     breaks=20, col="grey80", ylab="Number of cells")
+
+```
+
+Same quality check for ribosomal and ERCC spikes in data:
+these percetages should increase for low quality cells
+```{r}
+par(mfrow=c(1,2),mar=c(5.1, 4.1, 0.1, 0.1))
+hist(diaph_sce$total_counts_ribo, xlab="Ribosomal proportion (%)",ylab="Number of cells", breaks=20, main="",col= "grey80")
+hist(diaph_sce$total_counts_ERCC, xlab="ERCC proportion (%)",ylab="Number of cells", breaks=20, main="",col= "grey80")
+```
+
+
+###3.1.5.a Filter out low quality cells manually
+
+Pick a threshold:
+Remove cells more than 2 MAD(median absolute deviation) below the median for library size and total features. 
+The log option is chosen to better judge the smaller values and outliers should be looked for at both tails ("both"), by using the previous plots.
+Also remove cells more than 3 MAD below the median for ribosomal genes and ERCC spikes, with outliers looked at the heavy tail("lower").
+Finally, view remaining cells:
+```{r}
+libsize.drop <- isOutlier(diaph_sce$total_counts, nmads=2, type="both", log=TRUE)
+feature.drop <- isOutlier(diaph_sce$total_features_by_counts, nmads=2, type="both",log=TRUE)
+ribo.drop <- isOutlier(diaph_sce$pct_counts_ribo, nmads=3, type="lower", log=T)
+spike.drop <- isOutlier(diaph_sce$pct_counts_ERCC,nmads=3, type="lower",log=T)
+diaph_sce <- diaph_sce[,!(libsize.drop | feature.drop |ribo.drop | spike.drop )]
+data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop), ByRibo=sum(ribo.drop), ByERCC=sum(spike.drop), Remaining=ncol(diaph_sce))
+
+```
+
+###3.1.5.b Filter out low quality cells manually and automatically and compare
+
+Here is another method for selecting outliers.
+
+
+```{r}
+reads <- calculateQCMetrics(my_diaph_sce, feature_controls = list(ERCC = isSpike(my_diaph_sce, "ERCC"), RIBO = isSpike(my_diaph_sce, "ribo")))
+```
+
+
+Manually with the help of plots I named outliers by some value that seems to lead to a haevy tail:
+
+```{r}
+plotColData(reads, x = "log10_total_features_by_counts", y = "log10_total_counts",   colour_by = "type")
+```
+
+
+```{r}
+hist(reads$log10_total_counts, breaks = 100)
+abline(v = 4.8, col = "red")
+abline(v = 6.1, col = "red")
+```
+
+```{r}
+filter_by_total_counts <- (reads$log10_total_counts > 4.8 & reads$log10_total_counts < 6.1)
+table(filter_by_total_counts)
+```
+
+```{r}
+hist(reads$log10_total_features_by_counts, breaks = 100)
+abline(v = 3.1, col = "red")
+abline(v = 3.55, col = "red")
+```
+
+```{r}
+filter_by_expr_features <- (reads$log10_total_features_by_counts > 3.1 &reads$log10_total_features_by_counts < 3.55)
+table(filter_by_expr_features)
+```
+
+```{r}
+plotColData(reads, x = "log10_total_features_by_counts", y = "pct_counts_ERCC",   colour_by = "type")
+```
+
+
+```{r}
+hist(reads$pct_counts_ERCC, breaks = 100)
+abline(v = 3, col = "red")
+abline(v = 1, col = "red")
+```
+
+```{r}
+filter_by_ERCC <- ( reads$type != "NA" & reads$pct_counts_ERCC < 3 & reads$pct_counts_ERCC >1)
+table(filter_by_ERCC)
+```
+
+```{r}
+plotColData(reads, x = "total_features_by_counts", y = "pct_counts_ribo",   colour_by = "type")
+```
+
+
+```{r}
+hist(reads$pct_counts_RIBO, breaks = 100)
+abline(v = 2.4, col = "red")
+abline(v = 1.4, col = "red")
+```
+
+```{r}
+filter_by_RIBO <- (reads$type != "NA" & reads$pct_counts_RIBO < 2.4 & reads$pct_counts_RIBO >1.4)
+table(filter_by_RIBO)
+```
+
+```{r}
+reads$use <- (filter_by_expr_features & filter_by_total_counts &    filter_by_ERCC & filter_by_RIBO )
+
+table(reads$use)
+```
+
+
+
+Automatically detect outliers:
+
+Use PCA on QC metrics to detect outliers
+```{r}
+library(mvoutlier)
+reads <- runPCA( reads, use_coldata = TRUE, detect_outliers = TRUE)
+reducedDimNames(reads)
+table(reads$outlier)
+```
+
+
+```{r}
+plotReducedDim( reads, use_dimred = "PCA_coldata", size_by = "total_features_by_counts", shape_by = "use", colour_by = "outlier")
+```
+
+
+Compare manual and automatic selection:
+```{r}
+library(limma)
+auto <- colnames(reads)[reads$oulier]
+man <- colnames(reads)[!reads$use]
+venn.diag <- vennCounts(cbind(colnames(reads) %in% auto, colnames(reads) %in% man))
+vennDiagram(venn.diag, names = c("Automatic", "Manual"), circle.col = c("blue", "green"))
+```
+Manual and automatic methods are very close. The manual method gives a similar with the one found in 3.1.5.a, so I keep that one throughout the study.
+
+
+###3.1.6 Data normalisation
+
+Normalize data in order to eliminate cell-specific biases.
+With the hypothesis that genes are similarly distributed in all cells, any difference in count size of similarly distributed genes between 2 cells, indicate a bias that needs to be removed by scaling.
+Size factors are calculated(they represent the amount of counts to be scaled in each library).
+```{r}
+#data normalisation using a size factor approach. 
+diaph_sce <- computeSumFactors(diaph_sce, sizes=c(20, 40, 60, 80))
+summary(sizeFactors(diaph_sce))
+```
+
+Total counts over size factor plot: the scatter is caused by the presence of DE(differentialy expressed) genes for different types of cells.
+```{r}
+plot(sizeFactors(diaph_sce), diaph_sce$total_counts/1e6, log="xy",ylab="Library size (millions)", xlab="Size factor")
+```
+
+Compute size factors for spike groups:
+```{r}
+diaph_sce <- computeSpikeFactors(diaph_sce, type="ERCC", general.use=F)
+diaph_sce <- computeSpikeFactors(diaph_sce, type="ribo", general.use=F)
+```
+
+Plot of size factors of spike groups shows that they behave like noise.
+```{r}
+plot(sizeFactors(diaph_sce), diaph_sce$total_counts_feature_control/1e6, log="xy",ylab="Library size (millions)", xlab="Size factor")
+plot(sizeFactors(diaph_sce), diaph_sce$total_counts_ERCC/1e6, log="xy",ylab="Library size (millions)", xlab="Size factor")
+plot(sizeFactors(diaph_sce), diaph_sce$total_counts_ribo/1e6, log="xy",ylab="Library size (millions)", xlab="Size factor")
+```
+
+Percentage of total counts assigned to the top 30 most highly-abundant features in the dataset. For each gene(feature), each bar represents the percentage of that gene for a single cell, while the circle represents the average across all cells. 
+The different colours indicate the differently annotated cells of the dataset.
+There are present spike features that suggest they should be removed.
+```{r}
+plotHighestExprs(diaph_sce,n=30, colour_cells_by = "type")
+```
+
+
+```{r}
+diaph_sce <- scater::normalize(diaph_sce) #log normalised stored in logcounts
+```
+
+An additional way to normalize this data is to convert it to counts per million (CPM) by dividing each column by its total, then multiplying by 1,000,000.
+```{r}
+cpm(diaph_sce) <- log2(calculateCPM(diaph_sce, use_size_factors = F) + 1)
+```
+
+
+###3.1.7 Detecting Highly Variable Genes
+
+Model the technical coefficient of variation as a function of the mean. 
+```{r}
+out<-technicalCV2(diaph_sce, spike.type=NA, assay.type= "counts")
+out$HVG <- (out$FDR<0.05)
+
+as_tibble(out)
+```
+
+Highly variable genes are respsonsible for cell heterogeneity.
+Use the variance to decompose into biological and technical components. 
+Plot highly variable genes:
+```{r}
+ggplot(data = out) + geom_point(aes(x=log2(mean), y=log2(cv2), color=HVG), size=0.5) + geom_point(aes(x=log2(mean), y=log2(trend)), color="red", size=0.1)
+```
+
+Retrieve HVG:
+HVG are the ones with the largest biological components.
+```{r}
+out = out[out[, "HVG"] == TRUE,]
+out <- out[order(out$cv2, decreasing = T),]
+HVG_CV2 <- rownames(diaph_sce)[out$HVG]
+```
+
+
+
+Another way to separate to the biological componets is by taking into account only the endogenous genes, by leaving out of the calculations the spike information.
+The total variance of the endogenous genes is influenced primarily by the technical component.
+```{r}
+var.fit <- trendVar(diaph_sce,method="loess", use.spikes=F)
+var.out <- decomposeVar(diaph_sce, var.fit)
+```
+
+Confront the variance of the endogeneous genes with the spike-in genes' variance:
+The fit curve passes through most of the ERCC spikes that are technicaly related to most genes, whereas ignores the majority of ribosomal genes that present biological variability.
+```{r}
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression",
+ylab="Variance of log-expression")
+o <- order(var.out$mean)
+lines(var.out$mean[o], var.out$tech[o], col="dodgerblue", lwd=2)
+cur.spike1 <- isSpike(diaph_sce,"ERCC")
+cur.spike2 <- isSpike(diaph_sce,"ribo")
+points(var.out$mean[cur.spike1], var.out$total[cur.spike1], col="red", pch=16)
+points(var.out$mean[cur.spike2], var.out$total[cur.spike2], col="green", pch=16)
+```
+
+HVGs are genes with biological component >0.5 at a false discovery rate (FDR) of 5%.
+```{r}
+hvg.out <- var.out[which(var.out$FDR <= 0.05 & var.out$bio >= 0.5),]
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing=TRUE),]
+nrow(hvg.out)
+```
+
+Top 20 HVGs:
+```{r}
+plotExpression(diaph_sce, rownames(hvg.out)[1:20])
+```
+
+
+Remove ribosomal genes:
+```{r}
+isSpike(diaph_sce, "ribo") <- NULL
+spikeNames(diaph_sce)
+```
+
+Remove ERCC spikes:
+```{r}
+isSpike(diaph_sce, "ERCC") <- NULL
+spikeNames(diaph_sce)
+```
+
+
+
+#4 Dimensionality Reduction
+
+Reduce some of the noise of the data by projecting them on lower-dimensional space.
+
+##4.1 PCA
+
+###4.1.1 Perform PCA
+
+The data are log-transformed and normalized by library size (cpm), in order to reduce the 1st component variance and make the distribution more normal.
+```{r}
+PCA <- prcomp(t(logcounts(diaph_sce)))
+PCA_coord <- PCA$x
+colnames(PCA_coord) <- paste0("PC", seq(ncol(PCA_coord)))
+```
+
+Visualize data in 2 dimensions:
+Plot PC1 and PC2
+```{r}
+PCA_plot_df <- rownames_to_column(as.data.frame(PCA_coord), "Cell")
+PCA_ggplot <- ggplot(PCA_plot_df,aes(x=PC1, y =PC2))+ geom_point(aes(shape=diaph_sce$type, color=diaph_sce$type)) +theme_classic()
+PCA_ggplot
+```
+
+Plot explained Variances
+```{r}
+screeplot(PCA, type="lines", npcs = 20)
+```
+Significant components are around 10, before the curve's plateau.
+
+
+##4.2 tSNE
+
+After the visualisation of the cell heterogeneity, we want to characterise the different subgroups of cells.
+
+###4.2.1 Perform tSNE with SCE Object
+
+markers that are specific to skeletal cells
+```{r}
+skeletal.cell.markers <- c('Vcam1','Itga7','Calcr','Pax7','Myod1')
+```
+
+markers for mesenchymal cells
+```{r}
+mesenchymal.cell.markers <- c('Pdgfra')
+```
+
+markers for endothelial cells
+```{r}
+endothelial.cell.markers <- c("Pecam1")
+```
+
+markers for lemphocyte cells
+```{r}
+lemphocyte.cell.markers <- c("Cd69","Cd19","Cd79a")
+```
+
+markers for macrophage cells
+```{r}
+macro.cell.markers <- c("Ptprc", "Itgam","Fcer1g")
+```
+
+Running TSNE
+```{r}
+diaph_sce <- runTSNE(diaph_sce, perplexity= 10)
+plotTSNE(diaph_sce, colour_by="total_counts",
+         size_by="total_features_by_counts", shape_by = "type")
+```
+
+Running TSNE multiple times will result in different plots.
+Perplexity is the factor that changes the clusters' shapes.
+```{r}
+#diaph_sce <- runTSNE(diaph_sce, perplexity= 30)
+#plotTSNE(diaph_sce, colour_by="total_counts",          size_by="total_features_by_counts", shape_by = "type")
+```
+
+```{r}
+#diaph_sce <- runTSNE(diaph_sce, perplexity= 80)
+#plotTSNE(diaph_sce, colour_by="total_counts",          size_by="total_features_by_counts", shape_by = "type")
+```
+
+```{r}
+#diaph_sce <- runTSNE(diaph_sce, perplexity= 10)
+#plotTSNE(diaph_sce, colour_by="total_counts",         size_by="total_features_by_counts", shape_by = "type")
+```
+After running for different perplexity values, the value of 10 keeps the largest distances between clusters and separates best the different types.
+So I will be using the diaph_sce that is not influenced by the above reruns of TSNE.
+
+
+Lets see what cell types we have present using some of our key markers
+```{r}
+plotTSNE(diaph_sce, colour_by="Vcam1", shape_by = "type")
+```
+
+```{r}
+plotTSNE(diaph_sce, colour_by="Pdgfra", shape_by = "type")
+```
+
+
+```{r}
+
+plotTSNE(diaph_sce, colour_by="Pecam1", shape_by = "type")
+```
+
+```{r}
+plotTSNE(diaph_sce, colour_by="Cd79a", shape_by = "type")
+```
+
+```{r}
+plotTSNE(diaph_sce, colour_by="Itgam", shape_by = "type")
+```
+
+
+
+#5 Clustering
+
+Unsuperrvised clustering: create clusters with no prior knowledge of cell types, by only considering similarities of their features.
+The number of clusters is generally unknown.
+
+##5.1 Basic Clustering Methods
+
+###5.1.1 Hierarchical Clustering
+
+Calculate Distances, compare and create a hierarchy:
+```{r}
+distance <- dist(t(logcounts(diaph_sce)))
+ward_hclust <-hclust(distance,method = "ward.D2")
+par(mfrow=c(1,1))
+plot(ward_hclust,  labels = F, hang = 0.005)
+```
+
+Decide to cut the cluster tree: make 5 groups 
+```{r}
+cluster_hclust <- cutree(ward_hclust,k = 5)
+colData(diaph_sce)$cluster_hclust <- factor(cluster_hclust)
+plot_grid(plotTSNE(diaph_sce,colour_by = "cluster_hclust"))
+```
+The decision to cut the tree in 5 groups was made by considering the awaited 5 types of cells which are clearly clustered separately.
+
+###5.1.2 TSNE + Kmeans
+
+Run TSNE
+```{r}
+diaph_sce <- runTSNE(diaph_sce,perplexity= 10)
+```
+
+Do kmeans algorithm on TSNE coordinates
+```{r}
+deng_kmeans <- kmeans(x = diaph_sce@reducedDims$TSNE,centers = 5)
+TSNE_kmeans <- factor(deng_kmeans$cluster)
+colData(diaph_sce)$TSNE_kmeans <- TSNE_kmeans
+```
+
+Compare with hierarchical clustering
+```{r}
+plot_grid(plotTSNE(diaph_sce, colour_by = "TSNE_kmeans"),
+          plotTSNE(diaph_sce, colour_by = "cluster_hclust"))
+```
+
+Both clustering methods reveal the same clusters.
+
+
+
+#6 Put genes information into SCE Object
+
+```{r}
+rowData(diaph_sce)$feature_symbol <- rownames(diaph_sce)
+diaph_sce <- sc3(diaph_sce, ks = 5,n_cores = detectCores() - 2)
+```
+
+
+```{r}
+plotTSNE(diaph_sce, colour_by="sc3_5_clusters")
+plotTSNE(diaph_sce, colour_by="Vcam1")
+plotTSNE(diaph_sce, colour_by="Pdgfra")
+plotTSNE(diaph_sce, colour_by="Pecam1")
+plotTSNE(diaph_sce, colour_by="Cd79a")
+plotTSNE(diaph_sce, colour_by="Itgam")
+```
+
+
+```{r}
+concensus<-sc3_plot_consensus(diaph_sce, k = 5)
+```
+Question: In the example above we manually set the number of clusters to 3, but is this the best value we can use? hint: try using the sc3_estimate_k() function
+```{r}
+diaph_sce <- sc3_estimate_k(diaph_sce)
+str(metadata(diaph_sce)$sc3)
+```
+
+```{r}
+sc3_plot_consensus(diaph_sce, k = 5, show_pdata = c("type",     "log10_total_features", "sc3_5_clusters", "sc3_5_log2_outlier_score" ))
+```
+
+
+```{r}
+sc3_plot_expression(diaph_sce, k = 5, show_pdata = c("type",       "log10_total_features", "sc3_5_clusters", "sc3_5_log2_outlier_score" ))
+```
+
+
+
+#7 Differential Expression
+
+Find marker genes characterising the different groups by conducting differential expression analysis on the expression matrix.
+
+##7.1 Wilcoxon Test
+
+###7.1.1 Testing one group against another
+
+Test one group against another
+```{r}
+pValsgr <- apply(
+  counts(diaph_sce), 1, function(x) {
+    wilcox.test(
+      x[colData(diaph_sce)$sc3_5_clusters == 1], #1st cluster
+      x[colData(diaph_sce)$sc3_5_clusters == 2], #2nd cluster
+      alternative = "greater"
+    )$p.value
+  }
+)
+```
+
+
+```{r}
+pValsfdr <- p.adjust(pValsgr, method = "fdr")
+```
+
+sort genes by fdr and filter non significant genes 
+```{r}
+DE_genesfdr <- names(which(sort(pValsfdr) < (0.05)))
+head(DE_genesfdr)
+```
+
+```{r}
+plotTSNE(diaph_sce, colour_by = DE_genesfdr[1])
+```
+
+Plot Violin
+```{r}
+plotExpression(diaph_sce, x = "sc3_5_clusters", colour_by = "sc3_5_clusters",features = DE_genesfdr[1:6])+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+other filter methods for p.adjust tests give DE_genes:
+```{r}
+print(paste0("fdr = ", length(DE_genesfdr)))
+
+
+pValsBY <- p.adjust(pValsgr, method = "BY")
+DE_genesBY <- names(which(sort(pValsBY) < (0.05)))
+print(paste0("BY = ", length(DE_genesBY)))
+
+pValsbon <- p.adjust(pValsgr, method = "bonferroni")
+DE_genesbon <- names(which(sort(pValsbon) < (0.05)))
+print(paste0("bonferroni = ", length(DE_genesbon)))
+
+pValshom <- p.adjust(pValsgr, method = "hommel")
+DE_geneshom <- names(which(sort(pValshom) < (0.05)))
+print(paste0("hommel = ", length(DE_geneshom)))
+
+pValshoch <- p.adjust(pValsgr, method = "hochberg")
+DE_geneshoch <- names(which(sort(pValshoch) < (0.05)))
+print(paste0("hochberg = ", length(DE_geneshoch)))
+
+pValsno <- p.adjust(pValsgr, method = "none")
+DE_genesno <- names(which(sort(pValsno) < (0.05)))
+print(paste0("none = ", length(DE_genesno)))
+
+```
+frd and BY method seem similar, while bonferroni,hommel,hochberg are more strict.
+none method provides no filter.
+
+When we change our threshold for significance (current value is set to 0.05)
+```{r}
+print(paste0("fdr with 0.05 = ", length(DE_genesfdr)))
+
+pValsgrfdr1 <- p.adjust(pValsgr, method = "fdr")
+DE_genesgrfdr1 <- names(which(sort(pValsgrfdr1) < (0.001)))
+print(paste0("fdr with 0.001 = ", length(DE_genesgrfdr1)))
+
+pValsgrfdr2 <- p.adjust(pValsgr, method = "fdr")
+DE_genesgrfdr2 <- names(which(sort(pValsgrfdr2) < (0.2)))
+print(paste0("fdr with 0.2 = ", length(DE_genesgrfdr2)))
+```
+
+
+
+
+
+
+###7.1.2 Testing one group against all other
+
+Test one group against all other
+```{r}
+pVals <- apply(
+  counts(diaph_sce), 1, function(x) {
+    wilcox.test(
+      x[colData(diaph_sce)$sc3_5_clusters == 1], 
+      x[!(colData(diaph_sce)$sc3_5_clusters == 1)],
+      alternative = "greater"
+    )$p.value
+  }
+)
+```
+
+ multiple testing correction
+```{r}
+pValsf <- p.adjust(pVals, method = "fdr")
+```
+ 
+```{r}
+DE_genesf <- names(which(sort(pValsf) < (0.05)))
+head(DE_genesf)
+```
+
+```{r}
+plotPCA(diaph_sce, colour_by = DE_genesf[1])
+```
+
+```{r}
+plotExpression(diaph_sce,features = DE_genesf[1:6])+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+other methods for p.adjust tests give DE_genes:
+```{r}
+print(paste0("fdr = ", length(DE_genesf)))
+
+
+pValsBY <- p.adjust(pVals, method = "BY")
+DE_genesBY <- names(which(sort(pValsBY) < (0.05)))
+print(paste0("BY = ", length(DE_genesBY)))
+
+pValsbon <- p.adjust(pVals, method = "bonferroni")
+DE_genesbon <- names(which(sort(pValsbon) < (0.05)))
+print(paste0("bonferroni = ", length(DE_genesbon)))
+
+pValshom <- p.adjust(pVals, method = "hommel")
+DE_geneshom <- names(which(sort(pValshom) < (0.05)))
+print(paste0("hommel = ", length(DE_geneshom)))
+
+pValshoch <- p.adjust(pVals, method = "hochberg")
+DE_geneshoch <- names(which(sort(pValshoch) < (0.05)))
+print(paste0("hochberg = ", length(DE_geneshoch)))
+
+pValsno <- p.adjust(pVals, method = "none")
+DE_genesno <- names(which(sort(pValsno) < (0.05)))
+print(paste0("none = ", length(DE_genesno)))
+
+```
+
+Different threshold of significance: 
+```{r}
+print(paste0("fdr with 0.05 = ", length(DE_genesf)))
+
+pValsfdr1 <- p.adjust(pVals, method = "fdr")
+DE_genesfdr1 <- names(which(sort(pValsfdr1) < (0.001)))
+print(paste0("fdr with 0.001 = ", length(DE_genesfdr1)))
+
+pValsfdr2 <- p.adjust(pVals, method = "fdr")
+DE_genesfdr2 <- names(which(sort(pValsfdr2) < (0.2)))
+print(paste0("fdr with 0.1 = ", length(DE_genesfdr2)))
+```
